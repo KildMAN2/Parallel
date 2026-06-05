@@ -202,3 +202,109 @@ unlock                         notify _not_full ──► wakes sleeping push
 - **Circular buffer** — O(1) push/pop with no reallocation; satisfies the "all memory allocated at creation" requirement
 - **`condition_variable::wait` with predicate** — correctly handles spurious wakeups without extra `while` loops
 - **`notify_one` not `notify_all`** — only one thread can proceed (only one slot freed/filled), so waking one is sufficient and more efficient
+
+---
+
+## Worked Example
+
+Two producer threads `P1`, `P2` and two consumer threads `C1`, `C2` share a
+`BoundedQueue(3)` (capacity = 3). The `*` marks `_head`, the `^` marks `_tail`.
+
+### Step 0 — empty queue
+
+```
+buf: [ _ ] [ _ ] [ _ ]
+       *^
+_count = 0
+```
+
+`C1` calls `pop()`. The queue is empty, so it sleeps on `_not_empty` and
+releases the mutex.
+
+### Step 1 — `P1.push(10)`
+
+```cpp
+lock mutex
+_not_full.wait(...)        // _count=0 < cap=3, returns immediately
+_buf[_tail=0] = 10
+_tail = (0 + 1) % 3 = 1
+++_count                   // 1
+_not_empty.notify_one()    // wakes C1
+unlock
+```
+
+```
+buf: [10] [ _ ] [ _ ]
+       *    ^
+_count = 1
+```
+
+### Step 2 — `C1` wakes up and finishes its `pop`
+
+```cpp
+// inside wait(): re-acquired the mutex, re-checked predicate
+_count > 0 → true, proceed
+val = _buf[_head=0] = 10
+_head = 1
+--_count                   // 0
+_not_full.notify_one()
+return 10
+```
+
+```
+buf: [ _ ] [ _ ] [ _ ]
+            *^
+_count = 0
+```
+
+### Step 3 — `P1`, `P2` fill the queue
+
+`P1.push(20)`, `P2.push(30)`, `P1.push(40)` run interleaved; the mutex
+serializes them.
+
+```
+buf: [ _ ] [20] [30]                  after P1.push(20)
+            *    ^
+buf: [ _ ] [20] [30]                  after P2.push(30)
+            *         ^   (wrapped → 0)
+buf: [40] [20] [30]                   after P1.push(40)
+            *
+_count = 3
+```
+
+### Step 4 — queue is full; `P2.push(50)` blocks
+
+```cpp
+_not_full.wait(lock, [this]{ return _count < 3; })   // _count == 3
+// P2 is now sleeping; lock released
+```
+
+### Step 5 — `C2.pop()` frees a slot
+
+```
+val = _buf[1] = 20
+_head = 2
+--_count                   // 2
+_not_full.notify_one()     // wakes P2
+return 20
+```
+
+```
+buf: [40] [ _ ] [30]
+                  *
+```
+
+`P2` wakes inside `wait`, the predicate is now true, and it stores `50` at
+`_buf[0]` (the wrapped tail), giving the final state:
+
+```
+buf: [40] [50] [30]
+                  *    ^=1
+_count = 3
+```
+
+This trace illustrates the three core invariants:
+
+1. **Mutual exclusion** — only one thread touches `_buf`/`_head`/`_tail`/`_count` at a time.
+2. **Blocking on empty/full** — `wait(predicate)` handles spurious wakeups for free.
+3. **Wrap-around with `% _capacity`** — indices stay valid forever without copying memory.

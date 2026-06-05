@@ -183,3 +183,118 @@ it's only there so `size()` can return a meaningful number.
 - Every operation executes a fixed, finite number of steps regardless of what
   the other thread is doing — this is the strongest progress guarantee
   (wait-freedom).
+
+---
+
+## Worked Example
+
+`UnboundedQueue1p1c q;` is constructed with one dummy node `D0`:
+
+### Step 0 — only the dummy
+
+```
+[D0:?]
+  ^head
+  ^tail
+size = 0
+```
+
+Consumer calls `pop(val)`:
+
+```cpp
+head = _head        // D0
+next = head->next   // nullptr
+return false        // empty
+```
+
+No spinning, no sleeping — the dummy node is what makes this branch trivial.
+In a "no dummy" design, `pop` on empty would have to coordinate with the
+producer to update `_tail`; here it doesn't.
+
+### Step 1 — `push(10)`
+
+```cpp
+node = new Node(10);            // call it N1
+old_tail = _tail               // D0
+old_tail->next = node          // D0.next = N1
+_tail.store(N1, release)       // publishes both the link and N1.value
+```
+
+```
+[D0:?] -> [N1:10]
+   ^head      ^tail
+```
+
+### Step 2 — `push(20)`, `push(30)`
+
+```
+[D0:?] -> [N1:10] -> [N2:20] -> [N3:30]
+   ^head                            ^tail
+size = 3
+```
+
+### Step 3 — `pop(val)` returns `10`
+
+```cpp
+head = _head            // D0
+next = head->next       // N1   (non-null → not empty)
+val  = next->value      // 10
+_head.store(N1, release)
+delete head             // free old D0
+```
+
+```
+[N1:?] -> [N2:20] -> [N3:30]
+   ^head                ^tail
+size = 2
+```
+
+**N1 is now the new dummy.** Its `value` field is logically dead — the next
+`pop` will read `N2->value`, not `N1->value`. The "rotating dummy" pattern
+is why the queue never has to handle the empty/non-empty transition
+specially.
+
+### Step 4 — interleaved producer/consumer
+
+```
+Producer: push(40)              Consumer: pop(val)
+old_tail = N3                   head = N1
+N3.next = N4                    next = head->next = N2
+_tail.store(N4, release)        val = N2.value = 20
+                                _head.store(N2, release)
+                                delete N1
+```
+
+End state:
+
+```
+[N2:?] -> [N3:30] -> [N4:40]
+   ^head                ^tail
+```
+
+Even if the two threads execute in parallel, they touch **disjoint** fields:
+the producer mutates `N3.next` and `_tail`; the consumer mutates `N1.next`
+(read only) and `_head`. They never collide on the same pointer.
+
+### Why the release/acquire pair matters
+
+In Step 1 the producer writes:
+
+```
+N1.value  = 10        // (a)
+D0.next   = N1        // (b)
+_tail     = N1        // release store (c)
+```
+
+In Step 3 the consumer reads:
+
+```
+next = D0.next        // (b')
+val  = next->value    // (a')
+```
+
+The release on `_tail` ensures that any thread which observes `_tail == N1`
+via an `acquire` load is guaranteed to also see (a) and (b). The consumer
+gets this guarantee implicitly because the only way `D0.next` becomes
+non-null is *after* the producer's release store; observing the non-null
+`next` pointer is itself the synchronization signal.

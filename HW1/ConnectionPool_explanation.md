@@ -166,3 +166,131 @@ Because we *want to keep it alive*. A connection is expensive to recreate
 same set of `Connection` objects forever. The pool's destructor will free
 them when it itself is destroyed (each `unique_ptr` in the queue will
 delete its `Connection`).
+
+---
+
+## Worked Example
+
+`ConnectionPool pool(2);` is constructed with two pre-built connections,
+`C0` and `C1`. Two worker threads `T1` and `T2` and a third late-arriving
+thread `T3` use it.
+
+### Step 0 — initial state
+
+```
+pool queue: [ unique_ptr(C0) , unique_ptr(C1) ]
+mutex:      free
+waiters:    none
+```
+
+### Step 1 — `T1.borrowConnection()`
+
+```cpp
+lock mutex
+_available.wait(...)              // pool not empty → returns immediately
+conn = move(pool.front())         // takes ownership of C0's unique_ptr
+pool.pop()
+raw = conn.release()              // raw = C0*, unique_ptr now empty
+return shared_ptr<Connection>(raw, deleter)
+unlock
+```
+
+```
+pool queue: [ unique_ptr(C1) ]
+T1 holds:   shared_ptr(C0)        use_count = 1
+```
+
+### Step 2 — `T1` shares with `T2`
+
+```cpp
+// T1:
+auto copy = sp_C0;                // pass to T2 via some channel
+```
+
+```
+T1 holds:   shared_ptr(C0)        \
+T2 holds:   shared_ptr(C0)        / use_count = 2
+pool queue: [ unique_ptr(C1) ]
+```
+
+Note: even though *two* threads hold C0, the **pool still has only one
+connection left**. The shared_ptr's refcount tracks active users, the pool
+tracks availability.
+
+### Step 3 — `T3.borrowConnection()` takes C1
+
+```
+pool queue: [ ]                 (empty!)
+T3 holds:   shared_ptr(C1)      use_count = 1
+```
+
+### Step 4 — `T4.borrowConnection()` blocks
+
+```cpp
+lock mutex
+_available.wait(lock, [this]{ return !pool.empty(); })
+// pool IS empty → release mutex, sleep on _available
+```
+
+```
+pool queue: [ ]
+waiters:    T4 sleeping on _available
+```
+
+### Step 5 — `T1` finishes; its `shared_ptr` is destroyed
+
+```cpp
+// T1's local sp_C0 goes out of scope:
+// use_count drops 2 → 1
+// Deleter does NOT run yet, because T2 still holds a copy.
+```
+
+```
+T2 holds:   shared_ptr(C0)      use_count = 1
+pool queue: [ ]                 ← C0 still NOT returned
+T4 still sleeping
+```
+
+This is the key behavior the spec asks for: a connection is returned only
+when **every** thread that shares it is done.
+
+### Step 6 — `T2` finishes; deleter fires
+
+```cpp
+// T2's copy goes out of scope:
+// use_count drops 1 → 0
+// Custom deleter runs:
+lk(_mutex)
+pool.push(unique_ptr<Connection>(C0))      // C0 NOT deleted; recycled
+_available.notify_one()                    // wakes T4
+```
+
+```
+pool queue: [ unique_ptr(C0) ]
+T4 wakes inside wait(), predicate true, takes C0:
+T4 holds:   shared_ptr(C0)      use_count = 1
+pool queue: [ ]
+```
+
+### Step 7 — pool destruction
+
+When `pool` itself is finally destroyed, the `queue<unique_ptr<Connection>>`
+runs each `unique_ptr`'s destructor, which calls `delete` on the
+`Connection` — only **now** is the underlying object actually freed.
+
+```
+~ConnectionPool runs
+~queue runs
+~unique_ptr(C0) runs → delete C0  → "Connection 0 destroyed."
+~unique_ptr(C1) runs → delete C1  → "Connection 1 destroyed."
+```
+
+### Three invariants this trace illustrates
+
+1. **Pool capacity is fixed.** No `new Connection(...)` ever runs outside
+   the constructor; the deleter only **recycles** existing objects.
+2. **Sharing delays return.** A borrowed connection is returned only when
+   every `shared_ptr` to it has been destroyed.
+3. **Borrowing blocks when empty.** The condition variable ensures the
+   waiter sleeps efficiently (no spinning) and is woken the instant a
+   connection is returned.

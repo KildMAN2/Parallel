@@ -145,3 +145,99 @@ full it returns `false` immediately; same for `pop` on an empty queue. The
 single-producer/single-consumer assumption means **the only contention is on
 the two cache lines holding `_head` and `_tail`** — which is the absolute
 minimum.
+
+---
+
+## Worked Example
+
+`BoundedQueue1p1c(3)` → 3 usable slots, internal `_capacity = 4`. `H` marks
+`_head`, `T` marks `_tail`.
+
+### Step 0 — empty
+
+```
+buf: [ _ ] [ _ ] [ _ ] [ _ ]
+       HT
+size = (0 − 0 + 4) % 4 = 0
+```
+
+Consumer calls `pop`: `head == tail`, returns `false` immediately.
+No sleeping, no spinning — the spec requires "return false if empty."
+
+### Step 1 — `push(10)`
+
+```cpp
+tail = _tail.load(relaxed)            // 0
+next_tail = 1
+_head.load(acquire) == 0              // 1 != 0, NOT full
+_buf[0] = 10
+_tail.store(1, release)               // publishes the write of _buf[0]
+```
+
+```
+buf: [10] [ _ ] [ _ ] [ _ ]
+       H    T
+```
+
+### Step 2 — `push(20)`, `push(30)`
+
+```
+buf: [10] [20] [30] [ _ ]
+       H              T
+size = (3 − 0 + 4) % 4 = 3
+```
+
+### Step 3 — `push(40)` returns `false` (full)
+
+```cpp
+tail = 3
+next_tail = (3 + 1) % 4 = 0
+_head.load(acquire) == 0              // next_tail == head → FULL
+return false
+```
+
+The spec for Ex2 says `push` returns `false` when full — no blocking, just
+report it. This is the reason for the `+1` slot: it's the marker for "full"
+without sharing a counter.
+
+### Step 4 — `pop(val)` returns `10`
+
+```cpp
+head = _head.load(relaxed)            // 0  (consumer reads its own index)
+tail = _tail.load(acquire)            // 3  (paired with producer's release in Step 1)
+head != tail → not empty
+val = _buf[0] = 10                    // safe because acquire above synced with release
+_head.store(1, release)               // tells producer "slot 0 is now free"
+```
+
+```
+buf: [10] [20] [30] [ _ ]
+            H         T
+```
+
+### Step 5 — `push(40)` succeeds
+
+```cpp
+tail = 3
+next_tail = 0
+_head.load(acquire) == 1              // 0 != 1 → not full
+_buf[0] = 40
+_tail.store(0, release)
+```
+
+```
+buf: [40] [20] [30] [ _ ]
+            H    T
+```
+
+The tail wrapped to `0`, the queue holds `20, 30, 40` in FIFO order.
+
+### Why no torn reads
+
+In Step 4, the consumer reads `_buf[0]` *after* it has observed `_tail == 3`
+via an `acquire` load. The producer's `release` store of `_tail` in Step 1
+formed a synchronizes-with edge — the consumer is guaranteed to see every
+write the producer made before that release, including `_buf[0] = 10`.
+
+Without `acquire`/`release`, the CPU could reorder the producer's `_buf[0] = 10`
+*after* its `_tail.store(1)`, and the consumer might read uninitialized memory.
