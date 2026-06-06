@@ -1,5 +1,5 @@
 /*
-Written by Yariv Aridor, 2022
+Written by Sari Mansour, 2026
 */
 
 #pragma once
@@ -10,6 +10,15 @@ Written by Yariv Aridor, 2022
 #include <memory>
 
 class BoundedQueue : public BoundedQueueAbstract {
+private:
+    const int              _capacity;
+    std::unique_ptr<int[]> _buf;
+    int                    _head;
+    int                    _tail;
+    int                    _count;
+    std::mutex             _mutex;
+    std::condition_variable _not_empty;
+    std::condition_variable _not_full;
 public:
     explicit BoundedQueue(int capacity)
         : _capacity(capacity),
@@ -47,13 +56,4 @@ public:
         _not_empty.notify_one();
     }
 
-private:
-    const int              _capacity;
-    std::unique_ptr<int[]> _buf;
-    int                    _head;
-    int                    _tail;
-    int                    _count;
-    std::mutex             _mutex;
-    std::condition_variable _not_empty;
-    std::condition_variable _not_full;
 };

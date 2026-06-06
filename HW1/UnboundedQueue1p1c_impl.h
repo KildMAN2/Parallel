@@ -1,5 +1,5 @@
 /*
-Written by Yariv Aridor, 2022
+Written by Sari Mansour, 2026
 */
 
 #pragma once
@@ -42,11 +42,9 @@ public:
     void push(int value) override {
         Node* node = new Node(value);
 
-        // Link the new node after the current tail.
-        // Release: ensures node->value is visible before the tail pointer update.
         Node* old_tail = _tail.load(std::memory_order_relaxed);
-        old_tail->next = node;                                      // visible after...
-        _tail.store(node, std::memory_order_release);               // ...this store
+        old_tail->next = node;                                      
+        _tail.store(node, std::memory_order_release);              
 
         _size.fetch_add(1, std::memory_order_relaxed);
     }
@@ -57,18 +55,15 @@ public:
     bool pop(int &val) override {
         Node* head = _head.load(std::memory_order_relaxed);
 
-        // Acquire: sync with producer's release store of _tail
-        // We read head->next; it's safe because only the consumer touches head.
-        Node* next = head->next;   // next is the real first element (or nullptr)
+        Node* next = head->next;   
 
-        if (next == nullptr) return false; // empty (only dummy)
+        if (next == nullptr) return false; 
 
         val = next->value;
 
-        // Make next the new dummy (consume it as the head)
         _head.store(next, std::memory_order_release);
 
-        delete head; // free the old dummy
+        delete head; 
 
         _size.fetch_sub(1, std::memory_order_relaxed);
         return true;

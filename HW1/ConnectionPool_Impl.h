@@ -1,5 +1,5 @@
 /*
-Written by Yariv Aridor, 2022
+Written by Sari Mansour, 2026
 */
 
 #pragma once
@@ -26,13 +26,11 @@ public:
         std::unique_lock<std::mutex> lock(_mutex);
         _available.wait(lock, [this]{ return !pool.empty(); });
 
-        // Take ownership of the raw pointer out of the unique_ptr
         std::unique_ptr<Connection> conn = std::move(pool.front());
         pool.pop();
 
         Connection* raw = conn.release();
 
-        // Custom deleter: returns the connection back to the pool
         auto deleter = [this](Connection* c) {
             std::unique_lock<std::mutex> lk(_mutex);
             pool.push(std::unique_ptr<Connection>(c));
