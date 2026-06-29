@@ -59,6 +59,19 @@ thread_local int thread_id;
   private copy** of this variable. The test harness assigns `thread_id = i`
   inside each thread, so the barrier can tell threads apart without any map.
 
+**Example — `thread_local` in action:**
+```cpp
+thread_local int thread_id;   // one private copy PER thread
+
+void run(int id, BinaryTreeBarrier& bar) {
+    thread_id = id;           // thread 3 stores 3 in ITS OWN copy
+    bar.barrier();            // inside, reading thread_id gives 3 for this thread,
+                              // 5 for the thread that set it to 5, etc.
+}
+// Without thread_local, all threads would share one variable and overwrite
+// each other's id -> chaos.
+```
+
 ---
 
 ## 3. The Implementation — `tree_barrier_impl.h`
@@ -117,6 +130,20 @@ The `padding` pushes each thread's flag onto its **own cache line** so two
 threads never write to the same line — avoiding **false sharing** (a slowdown
 where unrelated writes invalidate each other's cache). Starting at `true`
 matches the nodes starting at `false`.
+
+**Example — false sharing without padding:**
+```
+Cache line (64 bytes):  [ flag0 ][ flag1 ][ flag2 ] ...   <- all share ONE line
+Thread 0 writes flag0  -> CPU invalidates the whole line on every other core
+Thread 1 writes flag1  -> invalidates it again, even though flag1 != flag0
+```
+The writes don't actually conflict logically, but the hardware tracks whole
+cache lines, so the cores keep stealing the line from each other ("ping-pong")
+and everything slows down. With `PaddedSense` each flag sits alone on its own
+64-byte line, so the cores never fight:
+```
+[ flag0 + padding (64B) ][ flag1 + padding (64B) ][ flag2 + padding (64B) ]
+```
 
 ### 3.4 Data members
 ```cpp
@@ -215,6 +242,21 @@ void await(int nodeIdx, bool mySense)
 - `node.sense.load()` — atomically read the flag.
 - `while (... ) {}` — a **spin loop**: the thread keeps checking until released.
 
+**Example — why `fetch_sub` returning the OLD value identifies the last thread.**
+A leaf starts with `count = 2`. Two threads call `fetch_sub(1)`:
+```
+count starts at 2
+ thread A: fetch_sub(1) returns 2, count is now 1   -> position 2 != 1 -> NOT last -> spins
+ thread B: fetch_sub(1) returns 1, count is now 0   -> position 1 == 1 -> LAST  -> goes up
+```
+Even if A and B run at the exact same instant, `fetch_sub` is **atomic**, so one
+of them is guaranteed to get `2` and the other `1` — never both the same. That
+is how exactly one thread is chosen as "last" without any lock.
+
+**Counter-example (what a plain `int` would do):** `count--` is really *read,
+subtract, write*. Two threads could both read `2`, both write `1`, and neither
+sees `0` — the barrier would hang forever. `std::atomic` prevents this.
+
 **The logic, in words**
 
 1. Every arriving thread decrements the node's `count`.
@@ -251,6 +293,24 @@ void barrier() override
   always alternate together, a thread is released exactly when *its* round's
   sense appears — this is the classic **sense-reversal** trick that lets the
   same barrier object be reused round after round without resetting flags.
+
+**Example — sense-reversal over 3 rounds (one node, one thread's view):**
+```
+start:  node.sense = false        thread's mySense flag = true
+
+Round 1: mySense=true.  Waiters spin while node.sense != true.
+         Last arrival sets node.sense=true -> released.
+         Thread flips its flag: true -> false.
+
+Round 2: mySense=false. Waiters spin while node.sense != false.
+         Last arrival sets node.sense=false -> released.
+         Thread flips its flag: false -> true.
+
+Round 3: mySense=true again... and so on.
+```
+The flag and the node flip *together* every round, so a leftover `sense` value
+from the previous round can never accidentally release this round's waiters. No
+reset needed — that is why the same barrier object works for unlimited rounds.
 
 ---
 
