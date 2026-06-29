@@ -7,6 +7,7 @@
 #include <barrier>
 #include <algorithm>
 #include <utility>
+#include <functional>
 #include <tbb/tbb.h>
 
 /*
@@ -27,29 +28,43 @@
  * every worker handles one row (then one column), giving O(N) work per worker.
  */
 
-// Partition [0, total) into numThreads contiguous, near-equal blocks and return
-// the [start, end) range owned by thread t.
+// Partition the range [0, totalItems) into numThreads contiguous, near-equal
+// blocks and return the [rangeStart, rangeEnd) block owned by thread threadId.
+//
+// Items rarely divide evenly among threads, so we give every thread a base
+// share of (totalItems / numThreads) items, then hand out the leftover
+// (totalItems % numThreads) items one-by-one to the first few threads. This
+// keeps block sizes balanced (they differ by at most 1) and contiguous.
+//
+// Example: totalItems = 8, numThreads = 3
+//   baseShare = 2, remainder = 2
+//   thread 0 -> [0, 3)  (2 base + 1 extra)
+//   thread 1 -> [3, 6)  (2 base + 1 extra)
+//   thread 2 -> [6, 8)  (2 base, no extra)
 static inline std::pair<unsigned long long, unsigned long long>
-partitionRange(int t, int numThreads, unsigned long long total)
+partitionRange(int threadId, int numThreads, unsigned long long totalItems)
 {
-    unsigned long long chunk = total / static_cast<unsigned long long>(numThreads);
-    unsigned long long rem   = total % static_cast<unsigned long long>(numThreads);
-    unsigned long long ut    = static_cast<unsigned long long>(t);
-    unsigned long long start = ut * chunk + std::min<unsigned long long>(ut, rem);
-    unsigned long long end   = start + chunk + (ut < rem ? 1ULL : 0ULL);
-    return std::make_pair(start, end);
+    unsigned long long id        = static_cast<unsigned long long>(threadId);
+    unsigned long long baseShare = totalItems / static_cast<unsigned long long>(numThreads);
+    unsigned long long remainder = totalItems % static_cast<unsigned long long>(numThreads);
+
+    // Start: all earlier threads' base shares, plus one for each earlier thread
+    // that received an extra leftover item.
+    unsigned long long rangeStart = id * baseShare + std::min<unsigned long long>(id, remainder);
+
+    // End: this thread's start plus its own share (base, +1 if it gets a leftover).
+    unsigned long long rangeEnd   = rangeStart + baseShare + (id < remainder ? 1ULL : 0ULL);
+
+    return std::make_pair(rangeStart, rangeEnd);
 }
 
-// Compute the prefix sum sequentially in O(N^2), where NxN is the table size.
 inline void prefixSum_serial(TableAbs& table, unsigned long long N)
 {
-    // Phase 1: prefix sum along each row.
     for (unsigned long long i = 0; i < N; ++i) {
         for (unsigned long long j = 1; j < N; ++j) {
             table[i * N + j] += table[i * N + j - 1];
         }
     }
-    // Phase 2: prefix sum along each column.
     for (unsigned long long j = 0; j < N; ++j) {
         for (unsigned long long i = 1; i < N; ++i) {
             table[i * N + j] += table[(i - 1) * N + j];
@@ -57,55 +72,59 @@ inline void prefixSum_serial(TableAbs& table, unsigned long long N)
     }
 }
 
-// Compute the prefix sum in parallel by numThreads threads. With enough cores
-// the overall complexity is O(N); every thread has a complexity of O(N).
-inline void prefixSum_threads(TableAbs& table, unsigned long long N, int numThreads)
+// Work done by a single thread t: its share of the row pass, then (after the
+// barrier) its share of the column pass.
+inline void prefixSum_threads_worker(TableAbs& table, unsigned long long N,
+                                     int numThreads, int t, std::barrier<>& sync)
 {
-    if (numThreads < 1) {
-        numThreads = 1;
+    std::pair<unsigned long long, unsigned long long> rows =
+        partitionRange(t, numThreads, N);
+    for (unsigned long long i = rows.first; i < rows.second; ++i) {
+        for (unsigned long long j = 1; j < N; ++j) {
+            table[i * N + j] += table[i * N + j - 1];
+        }
     }
 
-    // The same threads are reused across both phases (separated by a barrier)
-    // so that each thread registers exactly once with the table's counters.
+    sync.arrive_and_wait();
+
+    std::pair<unsigned long long, unsigned long long> cols =
+        partitionRange(t, numThreads, N);
+    for (unsigned long long j = cols.first; j < cols.second; ++j) {
+        for (unsigned long long i = 1; i < N; ++i) {
+            table[i * N + j] += table[(i - 1) * N + j];
+        }
+    }
+}
+
+// Orchestrator: sets up the barrier, spawns the worker threads, and joins them.
+inline void prefixSum_threads(TableAbs& table, unsigned long long N, int numThreads)
+{
+    if(N == 0 || numThreads <= 1) {
+        return;
+    }
+    if (numThreads < 1) {
+        prefixSum_serial(table, N);
+        return;
+    }
+
     std::barrier<> sync(numThreads);
-
-    auto work = [&](int t) {
-        // Phase 1: rows owned by this thread.
-        std::pair<unsigned long long, unsigned long long> rows =
-            partitionRange(t, numThreads, N);
-        for (unsigned long long i = rows.first; i < rows.second; ++i) {
-            for (unsigned long long j = 1; j < N; ++j) {
-                table[i * N + j] += table[i * N + j - 1];
-            }
-        }
-
-        sync.arrive_and_wait();
-
-        // Phase 2: columns owned by this thread.
-        std::pair<unsigned long long, unsigned long long> cols =
-            partitionRange(t, numThreads, N);
-        for (unsigned long long j = cols.first; j < cols.second; ++j) {
-            for (unsigned long long i = 1; i < N; ++i) {
-                table[i * N + j] += table[(i - 1) * N + j];
-            }
-        }
-    };
 
     std::vector<std::thread> threads;
     threads.reserve(numThreads);
     for (int t = 0; t < numThreads; ++t) {
-        threads.emplace_back(work, t);
+        threads.emplace_back(prefixSum_threads_worker,
+                             std::ref(table), N, numThreads, t, std::ref(sync));
     }
     for (std::thread& th : threads) {
         th.join();
     }
 }
 
-// Compute the prefix sum in parallel by TBB. The overall complexity is O(N);
-// every TBB worker has a complexity of O(N).
 inline void prefixSum_tbb(TableAbs& table, unsigned long long N)
 {
-    // Phase 1: prefix sum along each row (rows are independent).
+    if(N == 0) {
+        return;
+    }
     tbb::parallel_for(
         tbb::blocked_range<unsigned long long>(0, N),
         [&](const tbb::blocked_range<unsigned long long>& r) {
@@ -116,7 +135,6 @@ inline void prefixSum_tbb(TableAbs& table, unsigned long long N)
             }
         });
 
-    // Phase 2: prefix sum along each column (columns are independent).
     tbb::parallel_for(
         tbb::blocked_range<unsigned long long>(0, N),
         [&](const tbb::blocked_range<unsigned long long>& r) {
@@ -128,4 +146,4 @@ inline void prefixSum_tbb(TableAbs& table, unsigned long long N)
         });
 }
 
-#endif // PREFIX_SUM_2D_IMPL
+#endif 
