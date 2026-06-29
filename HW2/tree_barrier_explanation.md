@@ -145,6 +145,47 @@ and everything slows down. With `PaddedSense` each flag sits alone on its own
 [ flag0 + padding (64B) ][ flag1 + padding (64B) ][ flag2 + padding (64B) ]
 ```
 
+**Iteration example — how one thread's `sense` flips each round.**
+Nodes start at `false`, threads start at `true`. Each `barrier()` call does:
+`mySense = my flag` → wait until the node shows `mySense` → flip my flag.
+
+```
+            t0.sense   leaf.sense   what happens this round
+start:        true       false      (initial values)
+
+ROUND 1: mySense=true,  spin while leaf.sense!=true,
+         last arrival sets leaf.sense=true  -> released,  flip t0.sense
+after:        false      true
+
+ROUND 2: mySense=false, spin while leaf.sense!=false,
+         last arrival sets leaf.sense=false -> released,  flip t0.sense
+after:        true       false
+
+ROUND 3: mySense=true,  ... sets leaf.sense=true  -> released, flip
+after:        false      true
+
+ROUND 4: mySense=false, ... sets leaf.sense=false -> released, flip
+after:        true       false
+```
+
+The flag goes **true → false → true → false …**, flipping together with the
+node every round. Because both flip together, a leftover value from the previous
+round never matches this round's `mySense`, so nobody is released early — that is
+why **no reset is needed** and the same barrier works for unlimited rounds.
+
+**Iteration example — two threads sharing a leaf** (`count=2`, both `mySense=true`):
+
+```
+step               count   leaf.sense   t0            t1
+t0 arrives          2->1    false        spins (not last)
+t1 arrives          1->0    false                      LAST -> climbs the tree
+root resolves       =2      true         released      returns, sets leaf.sense=true
+both continue                            t0.sense=false  t1.sense=false  (flipped)
+```
+
+Next round both read `mySense=false` and the same dance repeats with the senses
+inverted.
+
 ### 3.4 Data members
 ```cpp
 Node*                    m_nodes;       // array of N-1 tree nodes
