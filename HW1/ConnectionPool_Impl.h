@@ -10,8 +10,10 @@ Written by Sari Mansour, 2026
 #include <condition_variable>
 
 class ConnectionPool : public ConnectionPoolAbstract {
+private:
+    std::mutex              _mutex;
+    std::condition_variable _available;
 public:
-    // Construct the pool and pre-create poolSize connections
     explicit ConnectionPool(size_t poolSize) : ConnectionPoolAbstract(poolSize) {
         for (size_t i = 0; i < poolSize; ++i) {
             pool.push(std::unique_ptr<Connection>(new Connection(static_cast<int>(i))));
@@ -40,7 +42,5 @@ public:
         return std::shared_ptr<Connection>(raw, deleter);
     }
 
-private:
-    std::mutex              _mutex;
-    std::condition_variable _available;
+
 };

@@ -16,6 +16,10 @@ struct Node {
 };
 
 class UnboundedQueue1p1c : public UnboundedQueue1p1cAbstract {
+private:
+    std::atomic<Node*> _head;  
+    std::atomic<Node*> _tail;  
+    std::atomic<int>   _size;
 public:
     // Initialize with one dummy node.
     // head and tail both point to it.
@@ -28,7 +32,6 @@ public:
     }
 
     ~UnboundedQueue1p1c() {
-        // Drain remaining nodes (including the dummy)
         Node* cur = _head.load(std::memory_order_relaxed);
         while (cur) {
             Node* next = cur->next;
@@ -37,8 +40,6 @@ public:
         }
     }
 
-    // Called only by the single producer thread.
-    // Appends a new node after the current tail. Always succeeds.
     void push(int value) override {
         Node* node = new Node(value);
 
@@ -49,9 +50,6 @@ public:
         _size.fetch_add(1, std::memory_order_relaxed);
     }
 
-    // Called only by the single consumer thread.
-    // Returns false if only the dummy node remains (logically empty).
-    // Otherwise, pops head->next, makes it the new dummy, and returns true.
     bool pop(int &val) override {
         Node* head = _head.load(std::memory_order_relaxed);
 
@@ -73,8 +71,5 @@ public:
         return _size.load(std::memory_order_relaxed);
     }
 
-private:
-    std::atomic<Node*> _head;  // written only by consumer
-    std::atomic<Node*> _tail;  // written only by producer
-    std::atomic<int>   _size;
+
 };

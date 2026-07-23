@@ -11,6 +11,7 @@
 #include <tbb/tbb.h>
 
 /*
+ * Sari Mansour 
  * The 2D table A (NxN) is stored in row-major order, so logical element
  * A[i][j] lives at the flat index i*N + j (every access goes through
  * TableAbs::operator[], which is what the counters measure).
@@ -48,11 +49,8 @@ partitionRange(int threadId, int numThreads, unsigned long long totalItems)
     unsigned long long baseShare = totalItems / static_cast<unsigned long long>(numThreads);
     unsigned long long remainder = totalItems % static_cast<unsigned long long>(numThreads);
 
-    // Start: all earlier threads' base shares, plus one for each earlier thread
-    // that received an extra leftover item.
     unsigned long long rangeStart = id * baseShare + std::min<unsigned long long>(id, remainder);
 
-    // End: this thread's start plus its own share (base, +1 if it gets a leftover).
     unsigned long long rangeEnd   = rangeStart + baseShare + (id < remainder ? 1ULL : 0ULL);
 
     return std::make_pair(rangeStart, rangeEnd);
@@ -72,8 +70,6 @@ inline void prefixSum_serial(TableAbs& table, unsigned long long N)
     }
 }
 
-// Work done by a single thread t: its share of the row pass, then (after the
-// barrier) its share of the column pass.
 inline void prefixSum_threads_worker(TableAbs& table, unsigned long long N,
                                      int numThreads, int t, std::barrier<>& sync)
 {
@@ -96,7 +92,6 @@ inline void prefixSum_threads_worker(TableAbs& table, unsigned long long N,
     }
 }
 
-// Orchestrator: sets up the barrier, spawns the worker threads, and joins them.
 inline void prefixSum_threads(TableAbs& table, unsigned long long N, int numThreads)
 {
     if(N == 0 || numThreads <= 1) {

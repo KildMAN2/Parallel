@@ -6,6 +6,7 @@
 #include <vector>
 
 /*
+ * Sari Mansour
  * Combining binary tree barrier.
  *
  * A single shared sense-counter suffers from heavy memory contention because
@@ -32,15 +33,14 @@ private:
     static const int RADIX = 2;
 
     struct Node {
-        std::atomic<int>  count;   // remaining arrivals for this round
-        std::atomic<bool> sense;   // current release sense at this node
-        int               size;    // number of arrivals expected (== RADIX)
-        int               parent;  // index of parent node, -1 for the root
+        std::atomic<int>  count;   
+        std::atomic<bool> sense;   
+        int               size;   
+        int               parent;  
 
         Node() : count(0), sense(false), size(0), parent(-1) {}
     };
 
-    // Per-thread sense, padded to a cache line to avoid false sharing.
     struct PaddedSense {
         bool sense;
         char padding[64 - sizeof(bool)];
@@ -53,23 +53,18 @@ private:
     int                      m_firstLeaf;
     std::vector<PaddedSense> m_threadSense;
 
-    // Recursively combine up the tree. The last thread to arrive at a node
-    // propagates to its parent, then resets the node and flips its sense to
-    // release the threads spinning on it.
     void await(int nodeIdx, bool mySense)
     {
         Node& node = m_nodes[nodeIdx];
-        int position = node.count.fetch_sub(1);
+        int position = node.count.fetch_sub(1, std::memory_order_acq_rel);
         if (position == 1) {
-            // Last arrival at this node.
             if (node.parent != -1) {
                 await(node.parent, mySense);
             }
-            node.count.store(node.size);   // reset for the next round
-            node.sense.store(mySense);      // release the waiting threads
+            node.count.store(node.size, std::memory_order_release);   
+            node.sense.store(mySense, std::memory_order_release);      
         } else {
-            // Spin until the last arrival flips this node's sense.
-            while (node.sense.load() != mySense) {
+            while (node.sense.load(std::memory_order_acquire) != mySense) {
                 // busy-wait
             }
         }
@@ -85,11 +80,11 @@ public:
         m_threadSense.resize(numThreads > 0 ? numThreads : 0);
 
         if (numThreads <= 1) {
-            return; // a single thread (or none) needs no real tree
+            return; 
         }
 
-        m_numNodes  = numThreads - 1;          // complete binary tree
-        m_firstLeaf = numThreads / RADIX - 1;  // first leaf index in heap layout
+        m_numNodes  = numThreads - 1;         
+        m_firstLeaf = numThreads / RADIX - 1; 
 
         m_nodes = new Node[m_numNodes];
         for (int i = 0; i < m_numNodes; ++i) {
@@ -114,13 +109,11 @@ public:
         int t = thread_id;
         bool mySense = m_threadSense[t].sense;
 
-        // Each thread enters the tree at its leaf node.
         int leaf = m_firstLeaf + t / RADIX;
         await(leaf, mySense);
 
-        // Flip this thread's sense for the next barrier round.
         m_threadSense[t].sense = !mySense;
     }
 };
 
-#endif // TREE_BARRIER_IMPL_H
+#endif 

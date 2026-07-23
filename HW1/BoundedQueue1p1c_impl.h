@@ -9,6 +9,11 @@ Written Sari Mansour, 2026
 #include <memory>
 
 class BoundedQueue1p1c : public BoundedQueueAbstract_1p1c {
+private:
+    const int              _capacity; 
+    std::unique_ptr<int[]> _buf;
+    std::atomic<int>       _head;     
+    std::atomic<int>       _tail;     
 public:
     explicit BoundedQueue1p1c(int capacity)
         : _capacity(capacity + 1),
@@ -23,8 +28,6 @@ public:
         return (tail - head + _capacity) % _capacity;
     }
 
-    // Called only by the single consumer thread.
-    // Returns false (and leaves val unchanged) if the queue is empty.
     bool pop(int &val) override {
         int head = _head.load(std::memory_order_relaxed);
         int tail = _tail.load(std::memory_order_acquire); 
@@ -32,13 +35,10 @@ public:
         if (head == tail) return false; 
 
         val = _buf[head];
-        // Release: make the consumed slot visible to the producer
         _head.store((head + 1) % _capacity, std::memory_order_release);
         return true;
     }
 
-    // Called only by the single producer thread.
-    // Returns false if the queue is full.
     bool push(int v) override {
         int tail = _tail.load(std::memory_order_relaxed);
         int next_tail = (tail + 1) % _capacity;
@@ -50,9 +50,5 @@ public:
         return true;
     }
 
-private:
-    const int              _capacity; 
-    std::unique_ptr<int[]> _buf;
-    std::atomic<int>       _head;     
-    std::atomic<int>       _tail;     
+
 };
